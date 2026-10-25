@@ -1,4 +1,0 @@
--r requirements.txt
-pytest>=8,<10
-ruff>=0.8,<1
-nbformat>=5,<6

@@ -1,0 +1,17 @@
+class,train_objects,val_objects,total_objects
+rov,2653,664,3317
+plant,405,102,507
+animal_fish,611,153,764
+animal_starfish,274,124,398
+animal_shells,171,78,249
+animal_crab,247,62,309
+animal_eel,267,76,343
+animal_etc,180,55,235
+trash_etc,1630,409,2039
+trash_fabric,247,67,314
+trash_fishing_gear,127,69,196
+trash_metal,901,225,1126
+trash_paper,154,39,193
+trash_plastic,1490,374,1864
+trash_rubber,113,29,142
+trash_wood,271,69,340

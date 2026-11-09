@@ -73,43 +73,55 @@ def _get_iou_types(model):
 
 
 @torch.inference_mode()
-def evaluate(model, data_loader, device):
+def evaluate(model, data_loader, device, *, iou_types=None):
+    """Evaluate unfiltered predictions in the dataset's training-label space.
+
+    Mask R-CNN reports both bounding-box and mask metrics by default. Custom
+    detection models may pass iou_types explicitly. No display score threshold
+    is applied: COCO AP uses the full ranked predictions returned by the model.
+    """
+    if len(data_loader) == 0:
+        raise ValueError("Cannot evaluate an empty data loader.")
+    device = torch.device(device)
     n_threads = torch.get_num_threads()
-    # FIXME remove this and make paste_masks_in_image run on the GPU
-    torch.set_num_threads(1)
-    cpu_device = torch.device("cpu")
-    model.eval()
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    header = "Test:"
+    was_training = model.training
+    try:
+        torch.set_num_threads(1)
+        model.eval()
+        metric_logger = utils.MetricLogger(delimiter="  ")
+        coco = get_coco_api_from_dataset(data_loader.dataset)
+        if iou_types is None:
+            iou_types = _get_iou_types(model)
+        if not iou_types or any(t not in ("bbox", "segm", "keypoints") for t in iou_types):
+            raise ValueError("iou_types must contain bbox, segm or keypoints.")
+        coco_evaluator = CocoEvaluator(coco, iou_types)
+        valid_labels = set(coco.getCatIds())
 
-    coco = get_coco_api_from_dataset(data_loader.dataset)
-    iou_types = _get_iou_types(model)
-    coco_evaluator = CocoEvaluator(coco, iou_types)
+        for images, targets in metric_logger.log_every(data_loader, 100, "Test:"):
+            images = [img.to(device) for img in images]
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            model_time = time.time()
+            outputs = model(images)
+            if len(outputs) != len(targets):
+                raise ValueError("The model must return one prediction per image.")
+            outputs = [{k: v.to("cpu") for k, v in output.items()} for output in outputs]
+            model_time = time.time() - model_time
+            for output in outputs:
+                unknown = set(output["labels"].tolist()) - valid_labels
+                if unknown:
+                    raise ValueError(f"Prediction labels {sorted(unknown)} are outside the dataset label space.")
+            res = {int(target["image_id"]): output for target, output in zip(targets, outputs)}
+            evaluator_time = time.time()
+            coco_evaluator.update(res)
+            metric_logger.update(model_time=model_time, evaluator_time=time.time() - evaluator_time)
 
-    for images, targets in metric_logger.log_every(data_loader, 100, header):
-        images = list(img.to(device) for img in images)
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        model_time = time.time()
-        outputs = model(images)
-
-        outputs = [{k: v.to(cpu_device) for k, v in t.items()} for t in outputs]
-        model_time = time.time() - model_time
-
-        res = {target["image_id"]: output for target, output in zip(targets, outputs)}
-        evaluator_time = time.time()
-        coco_evaluator.update(res)
-        evaluator_time = time.time() - evaluator_time
-        metric_logger.update(model_time=model_time, evaluator_time=evaluator_time)
-
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    coco_evaluator.synchronize_between_processes()
-
-    # accumulate predictions from all images
-    coco_evaluator.accumulate()
-    coco_evaluator.summarize()
-    torch.set_num_threads(n_threads)
-    return coco_evaluator
+        metric_logger.synchronize_between_processes()
+        print("Averaged stats:", metric_logger)
+        coco_evaluator.synchronize_between_processes()
+        coco_evaluator.accumulate()
+        coco_evaluator.summarize()
+        return coco_evaluator
+    finally:
+        model.train(was_training)
+        torch.set_num_threads(n_threads)

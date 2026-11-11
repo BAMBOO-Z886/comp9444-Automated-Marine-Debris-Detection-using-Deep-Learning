@@ -1,4 +1,5 @@
 import math
+from numbers import Integral
 import sys
 import time
 
@@ -72,44 +73,98 @@ def _get_iou_types(model):
     return iou_types
 
 
+def _check_evaluation_coverage(expected_ids, seen_ids, errors):
+    """Check all ranks together, allowing DistributedSampler padding across ranks."""
+    coverage = utils.all_gather({"image_ids": list(seen_ids), "errors": sorted(errors)})
+    all_errors = sorted({error for rank in coverage for error in rank["errors"]})
+    if all_errors:
+        raise ValueError("Invalid evaluation image IDs: " + "; ".join(all_errors))
+    evaluated_ids = {image_id for rank in coverage for image_id in rank["image_ids"]}
+    missing = expected_ids - evaluated_ids
+    unexpected = evaluated_ids - expected_ids
+    if missing or unexpected:
+        raise ValueError(
+            f"Evaluation did not cover the intended dataset: {len(missing)} missing "
+            f"image IDs {sorted(missing)[:10]}, {len(unexpected)} unexpected image IDs "
+            f"{sorted(unexpected)[:10]}. Disable drop_last and use a Subset dataset "
+            "for intentional partial evaluation instead of a partial sampler."
+        )
+
+
 @torch.inference_mode()
-def evaluate(model, data_loader, device):
+def evaluate(model, data_loader, device, *, iou_types=None):
+    """Evaluate unfiltered predictions in the dataset's training-label space.
+
+    Faster R-CNN reports bounding-box metrics; Mask R-CNN also reports masks. Custom
+    detection models may pass iou_types explicitly. No display score threshold
+    is applied: COCO AP uses the full ranked predictions returned by the model.
+    Every image in the loader's dataset must be evaluated. For a smaller test,
+    wrap the dataset in Subset instead of using drop_last or a partial sampler.
+    """
+    if len(data_loader) == 0:
+        raise ValueError("Cannot evaluate an empty data loader.")
+    device = torch.device(device)
     n_threads = torch.get_num_threads()
-    # FIXME remove this and make paste_masks_in_image run on the GPU
-    torch.set_num_threads(1)
-    cpu_device = torch.device("cpu")
-    model.eval()
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    header = "Test:"
+    was_training = model.training
+    try:
+        torch.set_num_threads(1)
+        model.eval()
+        metric_logger = utils.MetricLogger(delimiter="  ")
+        coco = get_coco_api_from_dataset(data_loader.dataset)
+        if iou_types is None:
+            iou_types = _get_iou_types(model)
+        if not iou_types or any(t not in ("bbox", "segm", "keypoints") for t in iou_types):
+            raise ValueError("iou_types must contain bbox, segm or keypoints.")
+        coco_evaluator = CocoEvaluator(coco, iou_types)
+        valid_labels = set(coco.getCatIds())
+        expected_ids = set(coco.getImgIds())
+        seen_ids, coverage_errors = set(), set()
 
-    coco = get_coco_api_from_dataset(data_loader.dataset)
-    iou_types = _get_iou_types(model)
-    coco_evaluator = CocoEvaluator(coco, iou_types)
+        for images, targets in metric_logger.log_every(data_loader, 100, "Test:"):
+            images = [img.to(device) for img in images]
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            model_time = time.time()
+            outputs = model(images)
+            if len(outputs) != len(targets):
+                raise ValueError("The model must return one prediction per image.")
+            outputs = [{k: v.to("cpu") for k, v in output.items()} for output in outputs]
+            model_time = time.time() - model_time
+            for output in outputs:
+                unknown = set(output["labels"].tolist()) - valid_labels
+                if unknown:
+                    raise ValueError(f"Prediction labels {sorted(unknown)} are outside the dataset label space.")
+            res = {}
+            for target, output in zip(targets, outputs):
+                image_id = target.get("image_id")
+                if isinstance(image_id, torch.Tensor) and image_id.numel() == 1:
+                    image_id = image_id.item()
+                if not isinstance(image_id, Integral) or isinstance(image_id, bool):
+                    coverage_errors.add("each target image_id must be a scalar integer")
+                    continue
+                image_id = int(image_id)
+                if image_id not in expected_ids:
+                    coverage_errors.add(f"image_id {image_id} is outside the dataset")
+                    continue
+                if image_id in seen_ids:
+                    coverage_errors.add(f"duplicate image_id {image_id} on the same rank")
+                    continue
+                seen_ids.add(image_id)
+                res[image_id] = output
+            evaluator_time = time.time()
+            if res:
+                coco_evaluator.update(res)
+            metric_logger.update(model_time=model_time, evaluator_time=time.time() - evaluator_time)
 
-    for images, targets in metric_logger.log_every(data_loader, 100, header):
-        images = list(img.to(device) for img in images)
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        model_time = time.time()
-        outputs = model(images)
-
-        outputs = [{k: v.to(cpu_device) for k, v in t.items()} for t in outputs]
-        model_time = time.time() - model_time
-
-        res = {target["image_id"]: output for target, output in zip(targets, outputs)}
-        evaluator_time = time.time()
-        coco_evaluator.update(res)
-        evaluator_time = time.time() - evaluator_time
-        metric_logger.update(model_time=model_time, evaluator_time=evaluator_time)
-
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    coco_evaluator.synchronize_between_processes()
-
-    # accumulate predictions from all images
-    coco_evaluator.accumulate()
-    coco_evaluator.summarize()
-    torch.set_num_threads(n_threads)
-    return coco_evaluator
+        # Raise after every rank reaches this point, before COCO silently drops
+        # duplicates or reports AP on only the images visited by the sampler.
+        _check_evaluation_coverage(expected_ids, seen_ids, coverage_errors)
+        metric_logger.synchronize_between_processes()
+        print("Averaged stats:", metric_logger)
+        coco_evaluator.synchronize_between_processes()
+        coco_evaluator.accumulate()
+        coco_evaluator.summarize()
+        return coco_evaluator
+    finally:
+        model.train(was_training)
+        torch.set_num_threads(n_threads)

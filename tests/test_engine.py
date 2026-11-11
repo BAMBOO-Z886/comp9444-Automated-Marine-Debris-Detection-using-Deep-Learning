@@ -7,14 +7,19 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Subset
+from torchvision.models.detection import FasterRCNN
+from torchvision.models.detection.anchor_utils import AnchorGenerator
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, TwoMLPHead
+from torchvision.ops import MultiScaleRoIAlign
 
 from help_funciton.coco_utils import get_coco_api_from_dataset
-from help_funciton.engine import evaluate
+from help_funciton.engine import _check_evaluation_coverage, evaluate
 from help_funciton.marine_dataset import MarineDataset
 
 
@@ -186,6 +191,91 @@ class EvaluationEngineTest(unittest.TestCase):
         threads = torch.get_num_threads()
         with self.assertRaisesRegex(ValueError, "empty data loader"):
             self.evaluate_quietly(model, loader)
+        self.assertTrue(model.training)
+        self.assertEqual(torch.get_num_threads(), threads)
+
+    def test_drop_last_and_partial_samplers_cannot_silently_change_test_set(self):
+        loaders = (
+            DataLoader(self.dataset, batch_size=3, drop_last=True, collate_fn=collate),
+            # Omitting a negative image must also be treated as incomplete.
+            DataLoader(self.dataset, sampler=[0, 1, 3], batch_size=2, collate_fn=collate),
+        )
+        for loader in loaders:
+            with self.subTest(drop_last=loader.drop_last):
+                model = SyntheticModel()
+                threads = torch.get_num_threads()
+                with self.assertRaisesRegex(ValueError, "1 missing image IDs"):
+                    self.evaluate_quietly(model, loader)
+                self.assertTrue(model.training)
+                self.assertEqual(torch.get_num_threads(), threads)
+
+    def test_duplicate_image_ids_within_and_across_batches_are_rejected(self):
+        for indices in ([0, 0, 1, 2, 3], [0, 1, 0, 2, 3]):
+            with self.subTest(indices=indices):
+                loader = DataLoader(self.dataset, sampler=indices, batch_size=2, collate_fn=collate)
+                model = SyntheticModel()
+                threads = torch.get_num_threads()
+                with self.assertRaisesRegex(ValueError, "duplicate image_id 10"):
+                    self.evaluate_quietly(model, loader)
+                self.assertTrue(model.training)
+                self.assertEqual(torch.get_num_threads(), threads)
+
+    def test_invalid_target_image_ids_are_rejected_before_reporting(self):
+        for image_id, message in ((999, "outside the dataset"),
+                                  (10.5, "scalar integer"),
+                                  (torch.tensor([10, 20]), "scalar integer")):
+            with self.subTest(image_id=image_id):
+                def invalid_collate(batch):
+                    images, targets = collate(batch)
+                    targets[0]["image_id"] = image_id
+                    return images, targets
+
+                loader = DataLoader(self.dataset, batch_size=2, collate_fn=invalid_collate)
+                model = SyntheticModel()
+                with self.assertRaisesRegex(ValueError, message):
+                    self.evaluate_quietly(model, loader)
+                self.assertTrue(model.training)
+
+    def test_distributed_coverage_allows_padding_but_rejects_missing_or_invalid_ids(self):
+        # DistributedSampler may pad the last rank with another rank's image.
+        coverage = [
+            {"image_ids": [10, 20], "errors": []},
+            {"image_ids": [30, 10], "errors": []},
+        ]
+        with patch("help_funciton.engine.utils.all_gather", return_value=coverage):
+            _check_evaluation_coverage({10, 20, 30}, {10, 20}, set())
+            with self.assertRaisesRegex(ValueError, "1 missing image IDs"):
+                _check_evaluation_coverage({10, 20, 30, 40}, {10, 20}, set())
+        coverage[1]["errors"] = ["duplicate image_id 30 on the same rank"]
+        with patch("help_funciton.engine.utils.all_gather", return_value=coverage):
+            with self.assertRaisesRegex(ValueError, "duplicate image_id 30"):
+                _check_evaluation_coverage({10, 20, 30}, {10, 20}, set())
+
+    def test_real_faster_rcnn_evaluates_boxes_only_without_weight_downloads(self):
+        # Exercise torchvision's actual proposal/ROI/NMS path on tiny images.
+        # Random untrained scores are smoke-test results, not benchmark results.
+        backbone = torch.nn.Sequential(torch.nn.Conv2d(3, 8, 3, padding=1), torch.nn.ReLU())
+        backbone.out_channels = 8
+        model = FasterRCNN(
+            backbone,
+            num_classes=None,
+            min_size=16,
+            max_size=16,
+            rpn_anchor_generator=AnchorGenerator(((8,),), ((0.5, 1.0, 2.0),)),
+            rpn_pre_nms_top_n_test=20,
+            rpn_post_nms_top_n_test=10,
+            box_roi_pool=MultiScaleRoIAlign(["0"], output_size=2, sampling_ratio=2),
+            box_head=TwoMLPHead(8 * 2 * 2, 16),
+            box_predictor=FastRCNNPredictor(16, 4),
+            box_detections_per_img=10,
+        )
+        threads = torch.get_num_threads()
+        with redirect_stdout(io.StringIO()):
+            evaluator = evaluate(model, self.loader, "cpu")
+        self.assertEqual(set(evaluator.coco_eval), {"bbox"})
+        self.assertEqual(set(evaluator.coco_eval["bbox"].params.imgIds), {10, 20, 30, 40})
+        self.assertEqual(evaluator.coco_eval["bbox"].stats.shape, (12,))
+        self.assertTrue(np.isfinite(evaluator.coco_eval["bbox"].stats).all())
         self.assertTrue(model.training)
         self.assertEqual(torch.get_num_threads(), threads)
 

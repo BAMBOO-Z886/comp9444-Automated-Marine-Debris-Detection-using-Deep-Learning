@@ -4,6 +4,7 @@ Run with ``python -m unittest discover -s tests -v``. No dataset or weights
 are downloaded, and the synthetic scores are not project benchmark results.
 """
 
+import copy
 import io
 import tempfile
 import unittest
@@ -43,7 +44,8 @@ def empty_prediction():
     }
 
 
-def make_evaluator(perfect=True):
+def make_evaluator(perfect=True, iou_types=("bbox", "segm"), image_ids=None,
+                   modify_gt=None, modify_predictions=None):
     """Two objects, one negative image, and one category without any GT."""
     mask = np.zeros((16, 16), dtype=np.uint8)
     mask[3:11, 2:10] = 1
@@ -75,9 +77,18 @@ def make_evaluator(perfect=True):
                 "scores": torch.tensor([0.95]),
                 "masks": torch.tensor(mask.copy(), dtype=torch.float32)[None, None],
             }
+    if modify_predictions is not None:
+        modify_predictions(predictions)
+    if "segm" not in iou_types:
+        predictions = {image_id: {key: value for key, value in prediction.items() if key != "masks"}
+                       for image_id, prediction in predictions.items()}
+    if image_ids is not None:
+        predictions = {image_id: predictions[image_id] for image_id in image_ids}
+    if modify_gt is not None:
+        modify_gt(coco.dataset)
     with redirect_stdout(io.StringIO()):
         coco.createIndex()
-        evaluator = CocoEvaluator(coco, ["bbox", "segm"])
+        evaluator = CocoEvaluator(coco, list(iou_types))
         evaluator.update(predictions)
         evaluator.synchronize_between_processes()
         evaluator.accumulate()
@@ -171,10 +182,134 @@ class EvaluationReportsTest(unittest.TestCase):
             self.assertEqual(set(rows["class_name"]), {name})
             self.assertEqual(set(rows["iou_type"]), {"bbox", "segm"})
             values = rows[["AP", "AP50", "AR100"]].to_numpy()
+            np.testing.assert_array_equal(rows[["gt_instances", "gt_images"]], 0 if category_id == 17 else 1)
             if category_id == 17:
                 self.assertTrue(np.isnan(values).all())
             else:
                 np.testing.assert_allclose(values, 1.0, atol=1e-12)
+
+    def test_per_class_support_excludes_crowds_and_unevaluated_images(self):
+        def add_annotations(data):
+            extra = copy.deepcopy(data["annotations"][0])
+            extra.update(id=3, bbox=[1, 1, 8, 8])
+            crowd = copy.deepcopy(extra)
+            crowd.update(id=4, image_id=303, iscrowd=1)
+            data["annotations"].extend([extra, crowd])
+        evaluator = make_evaluator(image_ids=(101, 303), modify_gt=add_annotations)
+        table = per_class_metrics(evaluator, CLASS_NAMES)
+        for iou_type in ("bbox", "segm"):
+            rows = table.loc[table["iou_type"] == iou_type].set_index("category_id")
+            self.assertEqual(rows.loc[2, "gt_instances"], 2)
+            self.assertEqual(rows.loc[2, "gt_images"], 1)
+            self.assertEqual(rows.loc[9, "gt_instances"], 0)
+            self.assertEqual(rows.loc[9, "gt_images"], 0)
+            self.assertTrue(np.isnan(rows.loc[9, "AP"]))
+
+    def test_ranked_false_positives_duplicates_and_misses_change_ap_and_recall(self):
+        def one_class(data):
+            data["annotations"][1]["category_id"] = 2
+
+        def predictions_for(case):
+            def modify(predictions):
+                predictions[202]["labels"] = torch.tensor([2])
+                predictions[202]["scores"] = torch.tensor([0.8])
+                if case in ("high FP", "low FP"):
+                    predictions[303] = copy.deepcopy(predictions[101])
+                    predictions[303]["scores"] = torch.tensor([0.99 if case == "high FP" else 0.1])
+                elif case == "duplicate":
+                    predictions[101] = {key: torch.cat([value, value])
+                                        for key, value in predictions[101].items()}
+                    predictions[101]["scores"] = torch.tensor([0.95, 0.9])
+                elif case == "miss":
+                    predictions[202] = empty_prediction()
+            return modify
+
+        # COCO samples recall at 101 points. A single detected object out of
+        # two reaches the first 51; a duplicate is a FP before the second TP.
+        expected = {"high FP": (2 / 3, 1), "low FP": (1, 1),
+                    "duplicate": ((51 + 50 * 2 / 3) / 101, 1), "miss": (51 / 101, 0.5)}
+        for case, (ap, recall) in expected.items():
+            with self.subTest(case=case):
+                evaluator = make_evaluator(iou_types=("bbox",), modify_gt=one_class,
+                                           modify_predictions=predictions_for(case))
+                summary = summarize_evaluators({case: evaluator}).iloc[0]
+                self.assertAlmostEqual(summary["mAP"], ap)
+                self.assertAlmostEqual(summary["AP50"], ap)
+                self.assertAlmostEqual(summary["AR100"], recall)
+                table = per_class_metrics(evaluator, CLASS_NAMES).set_index("category_id")
+                self.assertAlmostEqual(table.loc[2, "AP"], ap)
+                self.assertEqual(table.loc[2, "gt_instances"], 2)
+                self.assertEqual(table.loc[2, "gt_images"], 2)
+
+    def test_bbox_only_and_mask_models_share_detection_comparison(self):
+        faster = make_evaluator(iou_types=("bbox",))
+        summary = summarize_evaluators({"Faster R-CNN": faster, "Mask R-CNN": self.perfect})
+        self.assertEqual(list(summary.loc[summary["model"] == "Faster R-CNN", "iou_type"]), ["bbox"])
+        self.assertEqual(len(summary), 3)
+        np.testing.assert_allclose(summary["mAP"], 1.)
+        self.assertEqual(set(per_class_metrics(faster, CLASS_NAMES)["iou_type"]), {"bbox"})
+        figure = plot_model_comparison(summary)
+        figure.canvas.draw()
+        self.assertEqual(len(figure.axes), 2)
+        self.assertEqual(len(figure.axes[0].patches), 4)
+        self.assertEqual(len(figure.axes[1].patches), 2)
+
+    def test_comparison_rejects_different_actually_evaluated_images(self):
+        subset = make_evaluator(iou_types=("bbox",), image_ids=(101, 202))
+        # The underlying COCO datasets are equal; only the evaluated IDs differ.
+        self.assertEqual(set(subset.coco_gt.getImgIds()), set(self.perfect.coco_gt.getImgIds()))
+        with self.assertRaisesRegex(ValueError, "evaluated image IDs"):
+            summarize_evaluators({"all images": self.perfect, "subset": subset})
+
+    def test_comparison_rejects_different_taxonomy_or_ground_truth(self):
+        modifiers = {
+            "taxonomy": lambda data: data["categories"][0].update(name="different class"),
+            "bbox": lambda data: data["annotations"][0].update(bbox=[3, 3, 8, 8]),
+            "area": lambda data: data["annotations"][0].update(area=128),
+            "crowd": lambda data: data["annotations"][0].update(iscrowd=1),
+        }
+        for name, modifier in modifiers.items():
+            with self.subTest(name=name):
+                changed = make_evaluator(iou_types=("bbox",), modify_gt=modifier)
+                with self.assertRaisesRegex(ValueError, "ground truth differ"):
+                    summarize_evaluators({"original": self.perfect, "changed": changed})
+
+    def test_comparison_ignores_annotation_order_and_ids(self):
+        def reorder(data):
+            data["annotations"].reverse()
+            for index, annotation in enumerate(data["annotations"], start=50):
+                annotation["id"] = index
+        equivalent = make_evaluator(iou_types=("bbox",), modify_gt=reorder)
+        summary = summarize_evaluators({"original": self.perfect, "equivalent": equivalent})
+        np.testing.assert_allclose(summary["mAP"], 1.)
+
+    def test_comparison_checks_masks_only_for_shared_segmentation_metrics(self):
+        def move_mask(data):
+            data["annotations"][0]["segmentation"] = [[1, 1, 9, 1, 9, 9, 1, 9]]
+        changed = make_evaluator(modify_gt=move_mask)
+        with self.assertRaisesRegex(ValueError, "for segm"):
+            summarize_evaluators({"original": self.perfect, "changed": changed})
+        bbox_only = make_evaluator(iou_types=("bbox",), modify_gt=move_mask)
+        summary = summarize_evaluators({"original": self.perfect, "bbox only": bbox_only})
+        np.testing.assert_allclose(summary["mAP"], 1.)
+
+    def test_standard_summary_rejects_mislabeled_coco_configurations(self):
+        changes = {
+            "area ranges": ("areaRng", [[0, 1e10], [0, 100], [100, 1000], [1000, 1e10]]),
+            "area labels": ("areaRngLbl", ["all", "medium", "small", "large"]),
+            "recall thresholds": ("recThrs", np.linspace(0, 1, 11)),
+            "IoU thresholds": ("iouThrs", np.array([0.5])),
+            "detection limits": ("maxDets", [1, 10, 50]),
+        }
+        for name, (attribute, value) in changes.items():
+            for parameter_source in ("current", "accumulated"):
+                with self.subTest(name=name, parameters=parameter_source):
+                    changed = copy.deepcopy(self.perfect)
+                    coco_eval = changed.coco_eval["bbox"]
+                    params = coco_eval.params if parameter_source == "current" else coco_eval.eval["params"]
+                    setattr(params, attribute, value)
+                    with self.assertRaises(ValueError):
+                        summarize_evaluators({"changed": changed})
 
     def test_curves_and_comparison_render_with_undefined_values(self):
         for iou_type in ("bbox", "segm"):
@@ -198,6 +333,23 @@ class EvaluationReportsTest(unittest.TestCase):
                 self.assertGreater(path.stat().st_size, 0)
                 if path.suffix == ".csv":
                     self.assertFalse(pd.read_csv(path).empty)
+
+    def test_mixed_model_export_keeps_segmentation_exclusive_to_mask_model(self):
+        faster = make_evaluator(iou_types=("bbox",))
+        with tempfile.TemporaryDirectory() as directory:
+            result = export_evaluation_results(
+                {"Faster R-CNN": faster, "Mask R-CNN": self.perfect}, directory, CLASS_NAMES,
+            )
+            summary = pd.read_csv(Path(directory) / "summary.csv")
+            per_class = pd.read_csv(Path(directory) / "per_class_metrics.csv")
+            self.assertEqual(set(summary.loc[summary["model"] == "Faster R-CNN", "iou_type"]), {"bbox"})
+            self.assertEqual(set(per_class.loc[per_class["model"] == "Faster R-CNN", "iou_type"]), {"bbox"})
+            self.assertEqual(set(summary.loc[summary["model"] == "Mask R-CNN", "iou_type"]), {"bbox", "segm"})
+            names = {Path(path).name for path in result["paths"]}
+            self.assertIn("01_Faster_R-CNN_bbox_pr.png", names)
+            self.assertNotIn("01_Faster_R-CNN_segm_pr.png", names)
+            self.assertIn("02_Mask_R-CNN_segm_pr.png", names)
+            self.assertTrue(all(Path(path).stat().st_size > 0 for path in result["paths"]))
 
     def test_prediction_plot_handles_empty_predictions_and_ground_truth(self):
         model = EmptyModel()

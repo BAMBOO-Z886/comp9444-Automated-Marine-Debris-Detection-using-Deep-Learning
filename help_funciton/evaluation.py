@@ -6,6 +6,8 @@ The confidence threshold in ``plot_predictions`` affects display only.
 """
 
 from pathlib import Path
+import hashlib
+import json
 import re
 
 import matplotlib.pyplot as plt
@@ -19,7 +21,9 @@ COCO_METRICS = (
     "mAP", "AP50", "AP75", "AP_small", "AP_medium", "AP_large",
     "AR1", "AR10", "AR100", "AR_small", "AR_medium", "AR_large",
 )
-CLASS_COLUMNS = ("iou_type", "category_id", "class_name", "AP", "AP50", "AR100")
+CLASS_COLUMNS = (
+    "iou_type", "category_id", "class_name", "gt_instances", "gt_images", "AP", "AP50", "AR100",
+)
 
 
 def _valid_mean(values):
@@ -43,13 +47,96 @@ def _evaluation_axes(coco_eval):
     return params, area_index, detection_index
 
 
+def _standard_report_params(coco_eval):
+    """Reject configurations that would give the standard column names another meaning."""
+    params, _, _ = _evaluation_axes(coco_eval)
+    expected = {
+        "iouThrs": np.linspace(0.5, 0.95, 10),
+        "recThrs": np.linspace(0, 1, 101),
+        "maxDets": [1, 10, 100],
+        "areaRng": [[0, 1e10], [0, 32 ** 2], [32 ** 2, 96 ** 2], [96 ** 2, 1e10]],
+    }
+    # summarize() reads current params, while the accumulated arrays describe
+    # eval['params']. Validate both in case a caller modified params afterward.
+    for candidate in (params, coco_eval.params):
+        if not candidate.useCats or list(candidate.areaRngLbl) != ["all", "small", "medium", "large"]:
+            raise ValueError("Summary labels require standard category-aware COCO area ranges.")
+        for name, values in expected.items():
+            actual, expected_values = np.asarray(getattr(candidate, name)), np.asarray(values)
+            if (actual.shape != expected_values.shape
+                    or not np.allclose(actual, expected_values, rtol=1e-10, atol=1e-12)):
+                raise ValueError(f"Summary labels require standard COCO {name}.")
+    return params
+
+
+def _ground_truth_signature(coco_eval, params, iou_type):
+    """Fingerprint the actual evaluated GT, independent of annotation order/IDs."""
+    coco = coco_eval.cocoGt
+    image_ids, category_ids = set(params.imgIds), set(params.catIds)
+    annotations = []
+    for annotation in coco.dataset.get("annotations", []):
+        if annotation["image_id"] not in image_ids or annotation["category_id"] not in category_ids:
+            continue
+        entry = {
+            "image_id": int(annotation["image_id"]),
+            "category_id": int(annotation["category_id"]),
+            "bbox": [float(value) for value in annotation["bbox"]],
+            "area": float(annotation["area"]),
+            "iscrowd": int(annotation.get("iscrowd", 0)),
+        }
+        if iou_type == "segm":
+            entry["segmentation"] = annotation.get("segmentation")
+        annotations.append(entry)
+
+    def encode_default(value):
+        if isinstance(value, bytes):
+            return value.decode("ascii")  # COCO's compressed RLE counts.
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        raise TypeError(f"Unsupported COCO metadata type: {type(value).__name__}")
+
+    def canonical(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=encode_default)
+
+    payload = {
+        "images": [(int(i), coco.imgs[i].get("file_name"), coco.imgs[i].get("height"), coco.imgs[i].get("width"))
+                   for i in sorted(image_ids)],
+        "categories": [(int(i), coco.cats[i].get("name")) for i in sorted(category_ids)],
+        "annotations": sorted(canonical(annotation) for annotation in annotations),
+    }
+    return hashlib.sha256(canonical(payload).encode("utf-8")).hexdigest()
+
+
+def _validate_comparable_evaluators(evaluators):
+    """Compare common metric types only, permitting bbox-only detection models."""
+    references = {}
+    for model_name, evaluator in evaluators.items():
+        for iou_type, coco_eval in evaluator.coco_eval.items():
+            if iou_type not in ("bbox", "segm"):
+                continue
+            params = _standard_report_params(coco_eval)
+            signature = _ground_truth_signature(coco_eval, params, iou_type)
+            if iou_type in references and references[iou_type][1] != signature:
+                reference_name = references[iou_type][0]
+                raise ValueError(
+                    f"Cannot compare {reference_name!r} and {model_name!r} for {iou_type}: "
+                    "evaluated image IDs, category taxonomy, or ground truth differ."
+                )
+            references.setdefault(iou_type, (model_name, signature))
+
+
 def summarize_evaluators(evaluators):
     """Return the 12 standard bbox/segm COCO metrics for each named model.
 
     ``evaluators`` maps model names to objects returned by ``engine.evaluate``.
     COCO evaluation must use the standard IoUs (0.50:0.05:0.95), area ranges,
     and maxDets=[1, 10, 100], as configured by the existing CocoEvaluator.
+    Models sharing a metric type must use the same evaluated images and GT.
+    A bbox-only Faster R-CNN can be compared with bbox/segm Mask R-CNN models.
     """
+    _validate_comparable_evaluators(evaluators)
     rows = []
     for model_name, evaluator in evaluators.items():
         for iou_type, coco_eval in evaluator.coco_eval.items():
@@ -58,11 +145,6 @@ def summarize_evaluators(evaluators):
             stats = np.asarray(coco_eval.stats, dtype=float)
             if stats.shape != (12,):
                 raise ValueError(f"{model_name}/{iou_type}: run COCO summarize() before reporting.")
-            params = coco_eval.params
-            if (list(params.maxDets) != [1, 10, 100]
-                    or len(params.iouThrs) != 10
-                    or not np.allclose(params.iouThrs, np.linspace(0.5, 0.95, 10))):
-                raise ValueError("Summary labels require standard COCO IoUs and maxDets=[1, 10, 100].")
             row = {"model": model_name, "iou_type": iou_type}
             row.update(zip(COCO_METRICS, np.where(stats >= 0, stats, np.nan)))
             rows.append(row)
@@ -70,9 +152,12 @@ def summarize_evaluators(evaluators):
 
 
 def per_class_metrics(evaluator, class_names):
-    """Return AP, AP50 and AR100 using category IDs from the evaluator.
+    """Return AP, AP50, AR100 and non-crowd support for evaluated images.
 
     Pass training-label IDs as keys in ``class_names`` for MarineDataset.
+    ``gt_instances`` counts non-crowd annotations; ``gt_images`` counts distinct
+    evaluated images containing those annotations. Absent classes have zero
+    support and undefined metrics, so sparse classes are visible in the report.
     COCO array layout: precision[T,R,K,A,M], recall[T,K,A,M]. See
     https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocotools/cocoeval.py
     """
@@ -86,11 +171,21 @@ def per_class_metrics(evaluator, class_names):
         iou50 = np.flatnonzero(np.isclose(params.iouThrs, 0.5))
         if not len(iou50):
             raise ValueError("AP50 requires an IoU=0.50 evaluation threshold.")
+        evaluated_ids = set(params.imgIds)
+        support = {category_id: {"instances": 0, "images": set()} for category_id in params.catIds}
+        for annotation in coco_eval.cocoGt.dataset.get("annotations", []):
+            category_id = annotation["category_id"]
+            if (annotation["image_id"] in evaluated_ids and category_id in support
+                    and not annotation.get("iscrowd", 0)):
+                support[category_id]["instances"] += 1
+                support[category_id]["images"].add(annotation["image_id"])
         for category_index, category_id in enumerate(params.catIds):
             rows.append({
                 "iou_type": iou_type,
                 "category_id": int(category_id),
                 "class_name": class_names.get(int(category_id), str(category_id)),
+                "gt_instances": support[category_id]["instances"],
+                "gt_images": len(support[category_id]["images"]),
                 "AP": _valid_mean(precision[:, :, category_index, area_index, detection_index]),
                 "AP50": _valid_mean(precision[iou50, :, category_index, area_index, detection_index]),
                 "AR100": _valid_mean(recall[:, category_index, area_index, detection_index]),

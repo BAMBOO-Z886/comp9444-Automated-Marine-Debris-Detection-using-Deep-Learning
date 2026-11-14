@@ -1,4 +1,3 @@
-import copy
 import os
 
 import torch
@@ -173,34 +172,14 @@ def convert_to_coco_api(ds):
 
 
 def get_coco_api_from_dataset(dataset):
-    # Preserve the requested subset and use the supplied COCO ground truth.
-    # Reconstructing annotations from transformed masks changes boxes/areas and
-    # needlessly decodes every image before inference.
-    base = dataset
-    indices = list(range(len(dataset)))
-    while isinstance(base, torch.utils.data.Subset):
-        indices = [int(base.indices[i]) for i in indices]
-        base = base.dataset
-    if isinstance(getattr(base, "coco", None), COCO):
-        image_ids = getattr(base, "image_ids", getattr(base, "ids", None))
-        if image_ids is not None:
-            selected_ids = {int(image_ids[i]) for i in indices}
-            raw = base.coco.dataset
-            label_map = getattr(base, "cat_to_label", None)
-            if label_map is None:
-                label_map = {c["id"]: c["id"] for c in raw["categories"]}
-            coco = COCO()
-            coco.dataset = {
-                "info": copy.deepcopy(raw.get("info", {})),
-                "images": [copy.deepcopy(x) for x in raw["images"] if x["id"] in selected_ids],
-                "categories": [dict(copy.deepcopy(c), id=label_map[c["id"]])
-                               for c in raw["categories"] if c["id"] in label_map],
-                "annotations": [dict(copy.deepcopy(a), category_id=label_map[a["category_id"]])
-                                for a in raw["annotations"]
-                                if a["image_id"] in selected_ids and a["category_id"] in label_map],
-            }
-            coco.createIndex()
-            return coco
+    # FIXME: This is... awful?
+    for _ in range(10):
+        if isinstance(dataset, torchvision.datasets.CocoDetection):
+            break
+        if isinstance(dataset, torch.utils.data.Subset):
+            dataset = dataset.dataset
+    if isinstance(dataset, torchvision.datasets.CocoDetection):
+        return dataset.coco
     return convert_to_coco_api(dataset)
 
 

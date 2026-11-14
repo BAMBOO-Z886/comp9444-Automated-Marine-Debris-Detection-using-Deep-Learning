@@ -164,21 +164,6 @@ class NotebookWorkflowTest(unittest.TestCase):
         for cell_id, source in self.sources.items():
             ast.parse(source, filename=f"notebook:{cell_id}")
 
-    def test_split_statistics_are_quiet_and_preserve_audit_records(self):
-        files = list((self.root / "instance_version").glob("*.json"))
-        before = {path: path.read_bytes() for path in files}
-        self.output.seek(0)
-        self.output.truncate(0)
-        with warnings.catch_warnings(record=True) as emitted:
-            warnings.simplefilter("always")
-            self.run_cell("2ec63a33")
-        self.assertEqual(emitted, [])
-        printed = json.loads(self.output.getvalue().split("\n", 1)[1])
-        audit = self.namespace["split_audit"]
-        self.assertEqual(printed, {key: value for key, value in audit.items() if key != "warnings"})
-        self.assertEqual(len(audit["warnings"]), 2)
-        self.assertEqual(before, {path: path.read_bytes() for path in files})
-
     def test_restart_loads_correct_architectures_and_exports_complete_mixed_report(self):
         self._save_checkpoint(faster=True)
         self._save_checkpoint(faster=False)

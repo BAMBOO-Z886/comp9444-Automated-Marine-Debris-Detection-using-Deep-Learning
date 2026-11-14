@@ -10,3 +10,4 @@ ipykernel>=6,<8
 --extra-index-url https://download.pytorch.org/whl/cu128
 
 torch==2.11.0+cu128
+scikit-learn
